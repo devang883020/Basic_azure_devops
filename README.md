@@ -27,8 +27,15 @@ GitHub Actions workflow triggers
                     ▼
         AKS Cluster (1 node, Standard_B2as_v2)
                     │
-                    ▼
-        LoadBalancer Service → Public IP → App reachable on the internet
+                    ├─► LoadBalancer Service → Public IP → App reachable on the internet
+                    │
+                    └─► Azure Monitor Agent (DaemonSet, auto-deployed)
+                                │
+                                ▼
+                    Azure Monitor Workspace (managed Prometheus)
+                                │
+                                ▼
+                    Azure Managed Grafana → dashboards
 ```
 
 **Resources used** (all inside a single resource group for easy cleanup):
@@ -36,6 +43,8 @@ GitHub Actions workflow triggers
 - Azure Container Registry: `acrpracticedevang` (Basic SKU)
 - AKS Cluster: `aks-practice` (1 node, free control-plane tier, `Standard_B2as_v2`)
 - Service Principal: `gh-actions-aks-practice` (scoped to the resource group only, Contributor role)
+- Azure Monitor Workspace: `amw-aks-practice` (managed Prometheus metrics storage)
+- Azure Managed Grafana: `grafana-aks-practice` (dashboards, no Helm install required)
 
 ---
 
@@ -240,6 +249,52 @@ jobs:
 
 ---
 
+## Monitoring (Azure Monitor Managed Prometheus + Managed Grafana)
+
+Rather than installing the self-hosted `kube-prometheus-stack` Helm chart (the approach used on EKS), this project uses **Azure Monitor managed service for Prometheus** paired with **Azure Managed Grafana** — Azure runs and scales the Prometheus backend, and Grafana comes with Kubernetes dashboards pre-built.
+
+### 1. Create the Azure Monitor workspace (Prometheus metrics storage)
+
+```bash
+az monitor account create --resource-group rg-aks-practice --name amw-aks-practice
+```
+
+### 2. Create the Managed Grafana instance
+
+```bash
+az grafana create --name grafana-aks-practice --resource-group rg-aks-practice
+```
+
+### 3. Get both resource IDs
+
+```bash
+WORKSPACE_ID=$(az monitor account show --resource-group rg-aks-practice --name amw-aks-practice --query id -o tsv)
+GRAFANA_ID=$(az grafana show --name grafana-aks-practice --resource-group rg-aks-practice --query id -o tsv)
+```
+
+> **Note:** Azure's validation for `--azure-monitor-workspace-resource-id` is strict about casing — it must be `resourceGroups` (capital G), not `resourcegroups`, even though resource IDs are normally case-insensitive elsewhere. If `az ... show --query id` returns lowercase, capitalize that segment manually before using it.
+
+### 4. Enable managed Prometheus on the AKS cluster
+
+```bash
+MSYS_NO_PATHCONV=1 az aks update --resource-group rg-aks-practice --name aks-practice \
+  --enable-azure-monitor-metrics \
+  --azure-monitor-workspace-resource-id $WORKSPACE_ID \
+  --grafana-resource-id $GRAFANA_ID
+```
+
+This deploys the Azure Monitor Agent as a DaemonSet automatically — no Helm chart, no PVC sizing, no manual scrape config.
+
+### 5. View dashboards
+
+```bash
+az grafana show --name grafana-aks-practice --resource-group rg-aks-practice --query properties.endpoint -o tsv
+```
+
+Open the returned URL and sign in with your Azure account — pre-built Kubernetes dashboards (node CPU/memory, pod status, etc.) are populated automatically, no manual dashboard import needed.
+
+---
+
 ## Issues Hit & Fixes (real debugging log)
 
 | Issue | Fix |
@@ -248,14 +303,21 @@ jobs:
 | `az acr build` → `TasksOperationsNotAllowed` | ACR Tasks (remote build) is blocked on free-trial subscriptions — build locally with `docker build`/`docker push` instead |
 | `az aks create` → VM size `Standard_B2s` not allowed | Free-trial subscriptions restrict available VM sizes per region — used `Standard_B2as_v2` instead |
 | `az aks get-credentials` → "different object already exists" | Added `--overwrite-existing` (needed when recreating a cluster with a previously-used name) |
-| Git Bash mangling `/subscriptions/...` into a Windows path | Prefixed the command with `MSYS_NO_PATHCONV=1` |
+| Git Bash mangling `/subscriptions/...` into a Windows path | Prefixed the command with `MSYS_NO_PATHCONV=1` — recurred on the `az aks update` for monitoring, same fix |
 | Credentials pasted into chat during setup | Rotated with `az ad sp credential reset` before continuing |
+| `--azure-monitor-workspace-resource-id not in the correct format` despite a correct-looking ID | Two causes: (1) Git Bash path mangling again — needed `MSYS_NO_PATHCONV=1`; (2) the returned resource ID used lowercase `resourcegroups`, but the validator requires `resourceGroups` |
 
 ---
 
 ## Cleanup
 
-Everything lives in one resource group, so teardown is one command:
+Almost everything lives in one resource group, so teardown is one command. Managed Grafana is the one exception worth deleting explicitly first if you want to be certain it's gone before the resource group finishes deleting:
+
+```bash
+az grafana delete --name grafana-aks-practice --resource-group rg-aks-practice --yes
+```
+
+Then the rest:
 
 ```bash
 az group delete --name rg-aks-practice --yes --no-wait
@@ -276,4 +338,5 @@ az ad sp delete --id <the-id-it-returned>
 - Private container registry workflow (ACR) with managed-identity-based pull auth
 - Managed Kubernetes (AKS) — cluster creation, scaling, and app deployment
 - End-to-end CI/CD: GitHub Actions building, pushing, and deploying automatically on push
+- Observability via Azure Monitor managed Prometheus + Managed Grafana — no self-hosted monitoring stack to maintain
 - Real troubleshooting against actual subscription/platform constraints, not a scripted happy path
